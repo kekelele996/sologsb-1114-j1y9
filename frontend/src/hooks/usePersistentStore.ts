@@ -1,23 +1,24 @@
 import { onUnmounted, reactive } from 'vue'
 import type { StoreApi } from 'zustand/vanilla'
 import Dexie, { type Table } from 'dexie'
-import type { Cave, Segment, Sketch, Station } from '@/types'
+import type { Cave, Segment, Sketch, Station, SurveyBatch } from '@/types'
 import { computeHorizontal, computeVertical } from '@/utils/survey'
 
 /** IndexedDB 数据结构版本号（升级迁移时使用） */
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
 
 export interface MetaRow {
   key: string
   value: number
 }
 
-/** Dexie 封装：洞穴 / 洞段 / 测点 / 草图 四张表 + 元数据表 */
+/** Dexie 封装：洞穴 / 洞段 / 测点 / 草图 / 测量批次 五张表 + 元数据表 */
 class CaveSurveyDb extends Dexie {
   caves!: Table<Cave, string>
   segments!: Table<Segment, string>
   stations!: Table<Station, string>
   sketches!: Table<Sketch, string>
+  batches!: Table<SurveyBatch, string>
   meta!: Table<MetaRow, string>
 
   constructor() {
@@ -30,7 +31,7 @@ class CaveSurveyDb extends Dexie {
       meta: 'key'
     })
     // v2：旧版测点记录缺少水平距/垂距，迁移时由斜距 + 倾角补齐
-    this.version(SCHEMA_VERSION)
+    this.version(2)
       .stores({
         caves: 'id, name, region, archived',
         segments: 'id, caveId, code, type',
@@ -50,6 +51,91 @@ class CaveSurveyDb extends Dexie {
               station.verticalDistance = computeVertical(station.dip, station.slopeDistance)
             }
           })
+      })
+    // v3：方位基准（磁北/真北）改判。新增批次表，测点挂批次与基准，草图加核认状态。
+    // 旧读数无基准记载，整体归入各洞穴「最早一批」（按磁北、磁偏角 0 处理，留待外业班补偏）。
+    this.version(SCHEMA_VERSION)
+      .stores({
+        caves: 'id, name, region, archived',
+        segments: 'id, caveId, code, type',
+        stations: 'id, segmentId, batchId, code, date, datum',
+        sketches: 'id, segmentId, code, mergeOrder, reviewStatus',
+        batches: 'id, caveId, code, datum',
+        meta: 'key'
+      })
+      .upgrade(async (tx) => {
+        await tx
+          .table<Station, string>('stations')
+          .toCollection()
+          .modify((station) => {
+            if (!Number.isFinite(station.horizontalDistance)) {
+              station.horizontalDistance = computeHorizontal(station.dip, station.slopeDistance)
+            }
+            if (!Number.isFinite(station.verticalDistance)) {
+              station.verticalDistance = computeVertical(station.dip, station.slopeDistance)
+            }
+            // 基准字段占位，批次归属在下面按洞段映射后回填
+            if (station.datum !== 'true' && station.datum !== 'magnetic') {
+              station.datum = 'magnetic'
+            }
+            if (!Number.isFinite(station.declination)) {
+              station.declination = 0
+            }
+          })
+
+        await tx
+          .table<Sketch, string>('sketches')
+          .toCollection()
+          .modify((sketch) => {
+            if (sketch.reviewStatus !== 'pending' && sketch.reviewStatus !== 'approved') {
+              sketch.reviewStatus = 'unaffected'
+            }
+            if (!sketch.reviewer) sketch.reviewer = ''
+            if (!sketch.reviewedAt) sketch.reviewedAt = ''
+          })
+
+        // 旧读数无基准记载：按洞穴归并出「最早一批」，再把测点回填到该批
+        const segments = await tx.table<Segment, string>('segments').toArray()
+        const caveOfSegment = new Map(segments.map((segment) => [segment.id, segment.caveId]))
+        const stations = await tx.table<Station, string>('stations').toArray()
+        const caveDates = new Map<string, { date: string; segmentIds: Set<string> }>()
+        for (const station of stations) {
+          const caveId = caveOfSegment.get(station.segmentId) ?? 'unknown'
+          const entry = caveDates.get(caveId) ?? { date: station.date ?? '', segmentIds: new Set<string>() }
+          if (!entry.date || (station.date && station.date < entry.date)) entry.date = station.date
+          entry.segmentIds.add(station.segmentId)
+          caveDates.set(caveId, entry)
+        }
+        const stamp = new Date().toISOString()
+        const batches: SurveyBatch[] = []
+        const batchOfCave = new Map<string, string>()
+        let seq = 0
+        for (const [caveId, info] of caveDates) {
+          seq += 1
+          const id = `batch_legacy_${String(seq).padStart(3, '0')}`
+          batchOfCave.set(caveId, id)
+          batches.push({
+            id,
+            caveId,
+            code: `B-${String(seq).padStart(2, '0')}`,
+            datum: 'magnetic',
+            declination: 0,
+            measuredAt: info.date || stamp.slice(0, 10),
+            note: '旧数据无基准记载，v3 升级归入最早一批（按磁北处理，磁偏角待外业班补记）',
+            createdAt: stamp
+          })
+        }
+        if (batches.length > 0) {
+          await tx.table<SurveyBatch, string>('batches').bulkPut(batches)
+          await tx
+            .table<Station, string>('stations')
+            .toCollection()
+            .modify((station) => {
+              if (!station.batchId) {
+                station.batchId = batchOfCave.get(caveOfSegment.get(station.segmentId) ?? 'unknown') ?? ''
+              }
+            })
+        }
       })
   }
 }
@@ -106,6 +192,8 @@ export async function seedDemoData(): Promise<void> {
   const caveId = 'cave_demo_001'
   const segmentA = 'seg_demo_001'
   const segmentB = 'seg_demo_002'
+  const batchEarly = 'batch_demo_001'
+  const batchTrue = 'batch_demo_002'
 
   const today = new Date().toISOString().slice(0, 10)
 
@@ -154,12 +242,39 @@ export async function seedDemoData(): Promise<void> {
     }
   ])
 
+  // 早年一批按磁北记录（当地磁偏角西偏 -2.5°）；改用真北后新开一批
+  await db.batches.bulkPut([
+    {
+      id: batchEarly,
+      caveId,
+      code: 'B-01',
+      datum: 'magnetic',
+      declination: -2.5,
+      measuredAt: today,
+      note: '早年罗盘导线，按磁北记方位角，需补 -2.5° 磁偏角折真北',
+      createdAt: new Date().toISOString()
+    },
+    {
+      id: batchTrue,
+      caveId,
+      code: 'B-02',
+      datum: 'true',
+      declination: 0,
+      measuredAt: today,
+      note: '改用真北后的复测批，方位角已按真北记录',
+      createdAt: new Date().toISOString()
+    }
+  ])
+
   await db.stations.bulkPut([
     {
       id: 'st_demo_001',
       segmentId: segmentA,
+      batchId: batchEarly,
       code: 'P1',
       bearing: 118.5,
+      datum: 'magnetic',
+      declination: -2.5,
       dip: -2.5,
       slopeDistance: 12.4,
       horizontalDistance: computeHorizontal(-2.5, 12.4),
@@ -168,13 +283,16 @@ export async function seedDemoData(): Promise<void> {
       surveyor: '陆昀',
       date: today,
       isClosurePoint: false,
-      note: '入口段，左壁有崩塌堆积'
+      note: '入口段，左壁有崩塌堆积（磁北读数）'
     },
     {
       id: 'st_demo_002',
       segmentId: segmentA,
+      batchId: batchEarly,
       code: 'P2',
       bearing: 121.2,
+      datum: 'magnetic',
+      declination: -2.5,
       dip: -1.8,
       slopeDistance: 15.8,
       horizontalDistance: computeHorizontal(-1.8, 15.8),
@@ -183,7 +301,7 @@ export async function seedDemoData(): Promise<void> {
       surveyor: '陆昀',
       date: today,
       isClosurePoint: true,
-      note: '本段末站，已与 C-02 起点核对'
+      note: '本段末站，已与 C-02 起点核对（磁北读数）'
     }
   ])
 
@@ -197,7 +315,10 @@ export async function seedDemoData(): Promise<void> {
       author: '陆昀',
       mergeOrder: 1,
       anchorStake: 'K0+000',
-      imageNote: '平面展开草图，坐标纸 48 格，含左壁支护标注'
+      imageNote: '平面展开草图，坐标纸 48 格，含左壁支护标注',
+      reviewStatus: 'pending',
+      reviewer: '',
+      reviewedAt: ''
     },
     {
       id: 'sk_demo_002',
@@ -208,7 +329,10 @@ export async function seedDemoData(): Promise<void> {
       author: '覃羽',
       mergeOrder: 2,
       anchorStake: 'K0+120',
-      imageNote: '竖井剖面草图，标注三处锚点'
+      imageNote: '竖井剖面草图，标注三处锚点',
+      reviewStatus: 'pending',
+      reviewer: '',
+      reviewedAt: ''
     }
   ])
 }

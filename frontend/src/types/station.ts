@@ -1,11 +1,19 @@
 /** Station 测点：由方位角与斜距自动推算水平距与垂距 */
+import type { BearingDatum } from './datum'
+
 export interface Station {
   id: string
   segmentId: string
+  /** 所属外业测量批次（读数与其当时基准随批次保管） */
+  batchId: string
   /** 测点桩号，如 P12 */
   code: string
-  /** 前视方位角（十进制度，0-360） */
+  /** 前视方位角（十进制度，0-360，按 datum 记录基准） */
   bearing: number
+  /** 方位角基准：磁北 / 真北；旧数据在迁移时归入最早一批并继承其基准 */
+  datum: BearingDatum
+  /** 记录时磁偏角（东偏为正），磁北读数补偏用；真北读数为 0 */
+  declination: number
   /** 倾角（十进制度，-90 ~ 90） */
   dip: number
   /** 斜距（米） */

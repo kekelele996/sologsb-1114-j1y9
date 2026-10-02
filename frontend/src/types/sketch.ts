@@ -1,4 +1,6 @@
-/** Sketch 草图 */
+/** Sketch 草图（制图室保管的图幅） */
+import type { SheetStatus } from './datum'
+
 export interface Sketch {
   id: string
   segmentId: string
@@ -16,6 +18,12 @@ export interface Sketch {
   anchorStake: string
   /** 图片数据说明 */
   imageNote: string
+  /** 基准核认状态：基准更正后先转「待核」，制图室逐张「认过」；已认过的更正失败也保留 */
+  reviewStatus: SheetStatus
+  /** 认过制图人 */
+  reviewer: string
+  /** 认过时间（ISO） */
+  reviewedAt: string
 }
 
 /** 图幅拼合对齐结果 */

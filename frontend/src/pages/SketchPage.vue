@@ -2,6 +2,7 @@
 import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { Sketch, Station } from '@/types'
+import { SHEET_STATUS_LABELS } from '@/types'
 import BearingInput from '@/components/common/BearingInput.vue'
 import GridCanvas from '@/components/common/GridCanvas.vue'
 import { useStore } from '@/hooks/usePersistentStore'
@@ -9,7 +10,7 @@ import { caveStore } from '@/stores/caveStore'
 import { segmentStore } from '@/stores/segmentStore'
 import { stationStore } from '@/stores/stationStore'
 import { sketchStore } from '@/stores/sketchStore'
-import { toRadians } from '@/utils/survey'
+import { toRadians, trueBearingOf } from '@/utils/survey'
 import { uid } from '@/utils/id'
 
 const caveState = useStore(caveStore)
@@ -82,7 +83,8 @@ const rawPoints = computed<{ x: number; y: number; station: Station }[]>(() => {
   let east = 0
   let north = 0
   for (const station of segmentStations.value) {
-    const bearing = toRadians(station.bearing - baseBearing.value)
+    // 统一折真北后再投影，磁北批次先补磁偏角，避免两批折线错位
+    const bearing = toRadians(trueBearingOf(station) - baseBearing.value)
     east += station.horizontalDistance * Math.sin(bearing)
     north += station.horizontalDistance * Math.cos(bearing)
     points.push({ x: east, y: north, station })
@@ -109,7 +111,7 @@ const polyline = computed(() => plotPoints.value.map((point) => `${point.x},${po
 
 function dipArrow(point: PlotPoint, index: number): { x2: number; y2: number } {
   const length = 18 + Math.abs(point.station.dip)
-  const rad = toRadians(point.station.bearing)
+  const rad = toRadians(trueBearingOf(point.station))
   const dir = point.station.dip >= 0 ? -1 : 1
   return {
     x2: point.x + Math.cos(rad) * length,
@@ -155,7 +157,11 @@ async function submit(): Promise<void> {
     author: form.author.trim(),
     mergeOrder: Number(form.mergeOrder) || 1,
     anchorStake: form.anchorStake.trim(),
-    imageNote: form.imageNote.trim()
+    imageNote: form.imageNote.trim(),
+    // 新建图幅默认无需核认；当所在洞段读数后来被基准更正时会自动转待核
+    reviewStatus: existing?.reviewStatus ?? 'unaffected',
+    reviewer: existing?.reviewer ?? '',
+    reviewedAt: existing?.reviewedAt ?? ''
   }
   await sketchStore.getState().save(sketch)
   ElMessage.success(existing ? '草图记录已更新' : '草图记录已建立')
@@ -177,6 +183,28 @@ async function removeSketch(sketch: Sketch): Promise<void> {
   await ElMessageBox.confirm(`确认删除草图「${sketch.code}」？`, '删除确认', { type: 'warning' })
   await sketchStore.getState().remove(sketch.id)
   ElMessage.success('草图记录已删除')
+}
+
+/** 制图室逐张认过：核对新基准折线/锚点无误后确认 */
+async function approveSketch(sketch: Sketch): Promise<void> {
+  const { value } = await ElMessageBox.prompt(`确认图幅「${sketch.code}」已按真北折线与锚点核对无误？`, '图幅认过', {
+    confirmButtonText: '认过',
+    cancelButtonText: '取消',
+    inputPlaceholder: '认图人（制图室）',
+    inputValue: sketch.reviewer || '',
+    inputValidator: (text) => (text && text.trim() ? true : '请填写认图人')
+  })
+  await sketchStore.getState().review(sketch.id, value)
+  ElMessage.success(`图幅 ${sketch.code} 已认过`)
+}
+
+async function unapproveSketch(sketch: Sketch): Promise<void> {
+  await sketchStore.getState().unreview(sketch.id)
+  ElMessage.info(`图幅 ${sketch.code} 已撤回认过，转待核`)
+}
+
+function formatReviewedAt(iso: string): string {
+  return iso ? iso.slice(0, 16).replace('T', ' ') : ''
 }
 </script>
 
@@ -285,18 +313,36 @@ async function removeSketch(sketch: Sketch): Promise<void> {
 
     <h3 class="section-title">该洞段草图清单</h3>
     <el-table :data="segmentSketches" border stripe>
-      <el-table-column prop="mergeOrder" label="拼合顺序" width="100" />
-      <el-table-column prop="code" label="草图编号" width="110" />
-      <el-table-column prop="gridCount" label="格数" width="90" />
-      <el-table-column label="比例" width="110">
+      <el-table-column prop="mergeOrder" label="拼合顺序" width="90" />
+      <el-table-column prop="code" label="草图编号" width="100" />
+      <el-table-column prop="gridCount" label="格数" width="80" />
+      <el-table-column label="比例" width="90">
         <template #default="{ row }: { row: Sketch }">1 : {{ row.scale }}</template>
       </el-table-column>
-      <el-table-column prop="author" label="绘制人" width="100" />
-      <el-table-column prop="anchorStake" label="锚点桩号" width="130" />
-      <el-table-column prop="imageNote" label="图片数据说明" min-width="200" show-overflow-tooltip />
-      <el-table-column label="操作" width="130" fixed="right">
+      <el-table-column prop="author" label="绘制人" width="90" />
+      <el-table-column prop="anchorStake" label="锚点桩号" width="110" />
+      <el-table-column label="核认状态" width="170">
+        <template #default="{ row }: { row: Sketch }">
+          <el-tag
+            :type="row.reviewStatus === 'approved' ? 'success' : row.reviewStatus === 'pending' ? 'warning' : 'info'"
+            size="small"
+            :effect="row.reviewStatus === 'unaffected' ? 'plain' : 'dark'"
+          >
+            {{ SHEET_STATUS_LABELS[row.reviewStatus] }}
+          </el-tag>
+          <div v-if="row.reviewStatus === 'approved'" class="review-meta">
+            {{ row.reviewer }} · {{ formatReviewedAt(row.reviewedAt) }}
+          </div>
+        </template>
+      </el-table-column>
+      <el-table-column prop="imageNote" label="图片数据说明" min-width="170" show-overflow-tooltip />
+      <el-table-column label="操作" width="210" fixed="right">
         <template #default="{ row }: { row: Sketch }">
           <el-button link type="primary" size="small" @click="editSketch(row)">编辑</el-button>
+          <el-button v-if="row.reviewStatus !== 'approved'" link type="success" size="small" @click="approveSketch(row)">
+            认过
+          </el-button>
+          <el-button v-else link type="warning" size="small" @click="unapproveSketch(row)">撤回</el-button>
           <el-button link type="danger" size="small" @click="removeSketch(row)">删除</el-button>
         </template>
       </el-table-column>
@@ -322,5 +368,10 @@ async function removeSketch(sketch: Sketch): Promise<void> {
   display: flex;
   gap: 8px;
   padding-left: 90px;
+}
+.review-meta {
+  font-size: 11px;
+  color: #2f7a55;
+  margin-top: 2px;
 }
 </style>

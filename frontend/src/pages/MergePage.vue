@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import type { Sketch } from '@/types'
+import { SHEET_STATUS_LABELS } from '@/types'
 import ClosureBadge from '@/components/common/ClosureBadge.vue'
 import GridCanvas from '@/components/common/GridCanvas.vue'
 import SegmentTag from '@/components/common/SegmentTag.vue'
@@ -149,6 +150,8 @@ interface MergeRow {
   anchorStake: string
   offset: number
   snapped: boolean
+  reviewStatus: Sketch['reviewStatus']
+  reviewer: string
 }
 
 const mergeRows = computed<MergeRow[]>(() =>
@@ -158,9 +161,29 @@ const mergeRows = computed<MergeRow[]>(() =>
     segment: segmentOf(sketch),
     anchorStake: sketch.anchorStake,
     offset: offsets[sketch.id] ?? 0,
-    snapped: snapped[sketch.id] ?? false
+    snapped: snapped[sketch.id] ?? false,
+    reviewStatus: sketch.reviewStatus,
+    reviewer: sketch.reviewer
   }))
 )
+
+/** 制图室在拼合视图逐张认过：锚点/折线对齐确认后置已认过 */
+async function approveSheet(sketch: Sketch): Promise<void> {
+  const { value } = await ElMessageBox.prompt(`确认图幅「${sketch.code}」按真北锚点与邻幅拼合无误？`, '图幅认过', {
+    confirmButtonText: '认过',
+    cancelButtonText: '取消',
+    inputPlaceholder: '认图人（制图室）',
+    inputValue: sketch.reviewer || '',
+    inputValidator: (text) => (text && text.trim() ? true : '请填写认图人')
+  })
+  await sketchStore.getState().review(sketch.id, value)
+  ElMessage.success(`图幅 ${sketch.code} 已认过`)
+}
+
+async function unapproveSheet(sketch: Sketch): Promise<void> {
+  await sketchStore.getState().unreview(sketch.id)
+  ElMessage.info(`图幅 ${sketch.code} 已转回待核`)
+}
 
 async function move(index: number, direction: -1 | 1): Promise<void> {
   const list = [...mergeSketches.value]
@@ -175,14 +198,16 @@ async function move(index: number, direction: -1 | 1): Promise<void> {
 function exportMergeTable(): void {
   downloadCsv(
     '图幅拼合顺序表.csv',
-    mergeRows.value as unknown as Record<string, unknown>[],
+    mergeRows.value.map((row) => ({ ...row, reviewStatus: SHEET_STATUS_LABELS[row.reviewStatus] })),
     [
       { key: 'order', label: '拼合顺序' },
       { key: 'code', label: '草图编号' },
       { key: 'segment', label: '洞段' },
       { key: 'anchorStake', label: '锚点桩号' },
       { key: 'offset', label: '对齐偏移(px)' },
-      { key: 'snapped', label: '是否吸附' }
+      { key: 'snapped', label: '是否吸附' },
+      { key: 'reviewStatus', label: '核认状态' },
+      { key: 'reviewer', label: '认图人' }
     ]
   )
   ElMessage.success('拼合顺序表已导出')
@@ -244,7 +269,8 @@ function exportMergeTable(): void {
             height="96"
             rx="6"
             :fill="snapped[sketch.id] ? 'rgba(47,111,143,0.22)' : 'rgba(143,211,199,0.28)'"
-            :stroke="snapped[sketch.id] ? '#2f6f8f' : '#1f8a70'"
+            :stroke="sketch.reviewStatus === 'pending' ? '#c98a1b' : snapped[sketch.id] ? '#2f6f8f' : '#1f8a70'"
+            :stroke-dasharray="sketch.reviewStatus === 'pending' ? '6 4' : undefined"
             stroke-width="1.6"
           />
           <text :x="(offsets[sketch.id] ?? 0) + 8" :y="62 + (index % 2) * 10" font-size="12" fill="#1f3a4d">
@@ -255,6 +281,16 @@ function exportMergeTable(): void {
           </text>
           <text :x="(offsets[sketch.id] ?? 0) + 8" :y="96 + (index % 2) * 10" font-size="11" fill="#7a8896">
             1:{{ sketch.scale }} · {{ sketch.gridCount }} 格
+          </text>
+          <text
+            v-if="sketch.reviewStatus !== 'unaffected'"
+            :x="(offsets[sketch.id] ?? 0) + widthOf(sketch) - 8"
+            :y="56 + (index % 2) * 10"
+            text-anchor="end"
+            font-size="10"
+            :fill="sketch.reviewStatus === 'approved' ? '#2f7a55' : '#b8842a'"
+          >
+            {{ sketch.reviewStatus === 'approved' ? '✓ 已认过' : '待核' }}
           </text>
           <line
             :x1="offsets[sketch.id] ?? 0"
@@ -310,14 +346,42 @@ function exportMergeTable(): void {
       <el-table-column label="对齐偏移" width="120">
         <template #default="{ row }: { row: MergeRow }">{{ row.offset }} px</template>
       </el-table-column>
-      <el-table-column label="吸附状态" width="120">
+      <el-table-column label="吸附状态" width="110">
         <template #default="{ row }: { row: MergeRow }">
           <el-tag :type="row.snapped ? 'success' : 'info'" size="small" effect="plain">
             {{ row.snapped ? '已吸附' : '未吸附' }}
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="调整顺序" width="180">
+      <el-table-column label="核认状态" width="170">
+        <template #default="{ row }: { row: MergeRow }">
+          <el-tag
+            :type="row.reviewStatus === 'approved' ? 'success' : row.reviewStatus === 'pending' ? 'warning' : 'info'"
+            size="small"
+            :effect="row.reviewStatus === 'unaffected' ? 'plain' : 'dark'"
+          >
+            {{ SHEET_STATUS_LABELS[row.reviewStatus] }}
+          </el-tag>
+          <div v-if="row.reviewStatus === 'approved' && row.reviewer" class="reviewer">{{ row.reviewer }}</div>
+        </template>
+      </el-table-column>
+      <el-table-column label="图幅认过" width="120">
+        <template #default="{ row }: { row: MergeRow }">
+          <el-button
+            v-if="row.reviewStatus !== 'approved'"
+            link
+            type="success"
+            size="small"
+            @click="approveSheet(mergeSketches[row.order - 1])"
+          >
+            认过
+          </el-button>
+          <el-button v-else link type="warning" size="small" @click="unapproveSheet(mergeSketches[row.order - 1])">
+            撤回
+          </el-button>
+        </template>
+      </el-table-column>
+      <el-table-column label="调整顺序" width="150">
         <template #default="{ $index }: { $index: number }">
           <el-button link type="primary" size="small" :disabled="$index === 0" @click="move($index, -1)">上移</el-button>
           <el-button
@@ -372,5 +436,10 @@ function exportMergeTable(): void {
 }
 .sheet-group {
   cursor: grab;
+}
+.reviewer {
+  font-size: 11px;
+  color: #2f7a55;
+  margin-top: 2px;
 }
 </style>

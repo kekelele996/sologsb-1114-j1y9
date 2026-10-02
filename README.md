@@ -61,11 +61,11 @@ sologsb-1114/
 │   ├── nginx.conf              # try_files 前端路由回落 + gzip
 │   ├── public/favicon.svg
 │   └── src/
-│       ├── types/              # cave.ts / segment.ts / station.ts / sketch.ts / index.ts
-│       ├── stores/             # caveStore / segmentStore / stationStore / sketchStore（Zustand）
+│       ├── types/              # cave.ts / segment.ts / station.ts / sketch.ts / datum.ts / index.ts
+│       ├── stores/             # caveStore / segmentStore / stationStore / sketchStore / batchStore（Zustand）
 │       ├── components/common/  # SegmentTag / BearingInput / ClosureBadge / GridCanvas
 │       ├── hooks/              # usePersistentStore / useClosureCheck
-│       ├── pages/              # CavesPage / SegmentsPage / StationsPage / SketchPage / MergePage
+│       ├── pages/              # CavesPage / SegmentsPage / StationsPage / DatumPage / SketchPage / MergePage
 │       ├── router/index.ts
 │       └── utils/              # survey.ts / export.ts / id.ts
 ```
@@ -76,11 +76,13 @@ sologsb-1114/
 | --- | --- | --- |
 | Cave 洞穴 | 归属根节点：洞名、行政区、经纬度、海拔、发育层位、已知总长、负责人等 | `caves` |
 | Segment 洞段 | 起止桩号、类型（竖井/廊道/厅堂/裂隙/水道）、平均宽高、是否闭合 | `segments` |
-| Station 测点 | 方位角、倾角、斜距 → 自动推算水平距/垂距，累计闭合差 | `stations` |
-| Sketch 草图 | 格数、比例、绘制人、拼合顺序号、桩号对齐锚点 | `sketches` |
+| SurveyBatch 测量批次 | 外业班按批保管的读数基准：磁北/真北、磁偏角、测量日期 | `batches` |
+| Station 测点 | 方位角（含磁北/真北基准与磁偏角）、倾角、斜距 → 自动推算水平距/垂距，累计闭合差 | `stations` |
+| Sketch 草图 | 格数、比例、绘制人、拼合顺序号、桩号对齐锚点、基准核认状态（无需核认/待核/已认过） | `sketches` |
 
 - 数据库名 `gbcavesurvey`，`meta` 表保存 `schemaVersion`；
 - `version(2)` 升级迁移会把旧版测点记录由「斜距 + 倾角」补齐 `horizontalDistance` / `verticalDistance`；
+- `version(3)` 升级处理方位基准（磁北 → 真北）改判：新增 `batches` 表，测点挂 `batchId` / `datum` / `declination`，草图加 `reviewStatus` / `reviewer` / `reviewedAt`；**旧读数无基准记载时整体归入各洞穴「最早一批」（按磁北、磁偏角 0 处理，留待外业班补偏）**；
 - 数据仅存于浏览器本地，容器无状态、不挂载命名卷，清除浏览器数据即清空。
 
 ## 六、主要页面
@@ -89,12 +91,14 @@ sologsb-1114/
 | --- | --- |
 | `/caves` | 洞穴清单：卡片展示实测/已知总长、洞段数、最近测量日期，支持新建、编辑、归档、删除（删除前校验下级洞段数） |
 | `/segments` | 洞段编目表：按桩号区间/类型/洞穴筛选，批量调整洞段类型与闭合标记，自动累计总长 |
-| `/stations` | 测点读数录入：方位角/倾角专用输入（度分秒 ⇄ 十进制度），自动推算水平距垂距，实时闭合差徽标，异常读数整行高亮，支持连续录入下一站 |
-| `/sketch` | 草图工作台：坐标纸网格上绘制测点折线、标注桩号与倾角箭头，支持草图基准方位旋转与草图记录管理 |
+| `/stations` | 测点读数录入：方位角/倾角专用输入（度分秒 ⇄ 十进制度），选择测量批次并带磁北/真北基准与磁偏角，自动推算水平距垂距，实时闭合差徽标，异常读数整行高亮，支持连续录入下一站 |
+| `/datum` | 方位基准对账：外业班批次（读数+当时基准）与制图室图幅（草图+锚点）跨基准逐站对账；对磁北批次可「补磁偏角」（读数保留磁北、出图折真北）或「整批改判真北」（方位角重写），更正后受影响图幅转待核、已认过保留，失败按外业班读数重试 |
+| `/sketch` | 草图工作台：坐标纸网格上按**真北基准**绘制测点折线、标注桩号与倾角箭头，支持草图基准方位旋转、草图记录管理与图幅逐张认过 |
 | `/merge` | 图幅拼合视图：拖动图幅按相邻边缘吸附、按桩号锚点一键对齐，输出可调整的拼合顺序表并支持 CSV 导出 |
 
 ## 七、计算约定
 
 - 水平距 = 斜距 × cos(倾角)，垂距 = 斜距 × sin(倾角)；
 - 闭合差 f = √(ΣΔE² + ΣΔN²)，默认阈值 0.25 m，超限时徽标变红并可展开计算过程；
-- 方位角范围 0°–360°，倾角范围 -90°–90°，越界读数会被标记为异常。
+- 方位角范围 0°–360°，倾角范围 -90°–90°，越界读数会被标记为异常；
+- **方位基准统一折真北**：真方位角 = 磁方位角 + 磁偏角（东偏为正、西偏为负）；闭合差与草图折线对磁北读数先补磁偏角再投影，避免磁北/真北两批混算错位。

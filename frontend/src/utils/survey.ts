@@ -1,4 +1,4 @@
-import type { ClosureResult, Station } from '@/types'
+import type { BearingDatum, ClosureResult, Station } from '@/types'
 
 /** 角度转弧度 */
 export function toRadians(deg: number): number {
@@ -65,6 +65,40 @@ export function isValidBearing(deg: number): boolean {
   return Number.isFinite(deg) && deg >= 0 && deg < 360
 }
 
+/** 磁北方位角折算真北：东偏磁偏角为正，真北方位角 = 磁方位角 + 磁偏角 */
+export function magneticToTrue(magneticBearing: number, declination: number): number {
+  return normalizeBearing(magneticBearing + declination)
+}
+
+/** 真北方位角折算磁北（反向对账用） */
+export function trueToMagnetic(trueBearing: number, declination: number): number {
+  return normalizeBearing(trueBearing - declination)
+}
+
+/**
+ * 统一取真北方位角：
+ * - 真北读数直接归一化；
+ * - 磁北读数按其记录磁偏角补偏。
+ * 基准缺失的旧读数按磁北、零磁偏角处理（与最早一批保持一致）。
+ */
+export function trueBearingOf(station: Pick<Station, 'bearing' | 'datum' | 'declination'>): number {
+  if (station.datum === 'true') return normalizeBearing(station.bearing)
+  return magneticToTrue(station.bearing, station.declination || 0)
+}
+
+/** 任意方位角按基准折算到真北 */
+export function bearingToTrue(bearing: number, datum: BearingDatum, declination: number): number {
+  return datum === 'true' ? normalizeBearing(bearing) : magneticToTrue(bearing, declination)
+}
+
+/** 两方位角的有向夹角（-180, 180]，对账时衡量磁北/真北两批读数差 */
+export function bearingDelta(a: number, b: number): number {
+  let diff = (normalizeBearing(a) - normalizeBearing(b)) % 360
+  if (diff > 180) diff -= 360
+  if (diff <= -180) diff += 360
+  return round(diff, 4)
+}
+
 /** 校验倾角 */
 export function isValidDip(deg: number): boolean {
   return Number.isFinite(deg) && deg >= -90 && deg <= 90
@@ -110,14 +144,14 @@ export function stakeRangeOverlap(a1: number, a2: number, b1: number, b2: number
 }
 
 /**
- * 闭合差：把每站的方位角与水平距分解为东向/北向增量，
- * 导线闭合差即累计位移向量的模。
+ * 闭合差：把每站的方位角（统一折算真北）与水平距分解为东向/北向增量，
+ * 导线闭合差即累计位移向量的模。磁北批次读数先补磁偏角，避免两批混算错位。
  */
 export function computeClosure(stations: Station[], threshold = 0.25): ClosureResult {
   let east = 0
   let north = 0
   for (const station of stations) {
-    const bearing = toRadians(normalizeBearing(station.bearing))
+    const bearing = toRadians(trueBearingOf(station))
     const horizontal = station.horizontalDistance || computeHorizontal(station.dip, station.slopeDistance)
     east += horizontal * Math.sin(bearing)
     north += horizontal * Math.cos(bearing)

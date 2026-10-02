@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import type { Station } from '@/types'
+import type { BearingDatum, Station } from '@/types'
+import { BEARING_DATUM_LABELS } from '@/types'
 import BearingInput from '@/components/common/BearingInput.vue'
 import ClosureBadge from '@/components/common/ClosureBadge.vue'
 import SegmentTag from '@/components/common/SegmentTag.vue'
@@ -10,15 +11,18 @@ import { useClosureCheck } from '@/hooks/useClosureCheck'
 import { segmentStore } from '@/stores/segmentStore'
 import { stationStore } from '@/stores/stationStore'
 import { caveStore } from '@/stores/caveStore'
-import { computeHorizontal, computeVertical, formatDms, isValidBearing, isValidDip } from '@/utils/survey'
+import { batchStore } from '@/stores/batchStore'
+import { computeHorizontal, computeVertical, formatDms, isValidBearing, isValidDip, trueBearingOf } from '@/utils/survey'
 import { nextCode, uid } from '@/utils/id'
 
 const caveState = useStore(caveStore)
 const segmentState = useStore(segmentStore)
 const stationState = useStore(stationStore)
+const batchState = useStore(batchStore)
 
 const selectedCaveId = ref<string>(caveState.caves[0]?.id ?? '')
 const selectedSegmentId = ref<string>('')
+const selectedBatchId = ref<string>('')
 const editingId = ref<string | null>(null)
 const lastSaved = ref<string>('')
 
@@ -27,6 +31,8 @@ const form = reactive({
   bearing: 90,
   dip: 0,
   slopeDistance: 10,
+  datum: 'true' as BearingDatum,
+  declination: 0,
   instrumentNo: 'SOKKIA-2',
   surveyor: '',
   date: new Date().toISOString().slice(0, 10),
@@ -40,6 +46,12 @@ const segmentOptions = computed(() =>
 )
 const currentSegment = computed(() => segmentState.segments.find((segment) => segment.id === selectedSegmentId.value))
 
+/** 外业班保管的批次（读数与其当时基准随批次走） */
+const batchOptions = computed(() =>
+  batchState.batches.filter((batch) => !selectedCaveId.value || batch.caveId === selectedCaveId.value)
+)
+const currentBatch = computed(() => batchState.batches.find((batch) => batch.id === selectedBatchId.value))
+
 const segmentStations = computed(() =>
   stationState.stations
     .filter((station) => station.segmentId === selectedSegmentId.value)
@@ -50,8 +62,11 @@ const segmentStations = computed(() =>
 const pendingStation = computed<Station>(() => ({
   id: 'pending',
   segmentId: selectedSegmentId.value,
+  batchId: selectedBatchId.value,
   code: form.code,
   bearing: form.bearing,
+  datum: form.datum,
+  declination: form.datum === 'magnetic' ? form.declination : 0,
   dip: form.dip,
   slopeDistance: form.slopeDistance,
   horizontalDistance: previewHorizontal.value,
@@ -108,6 +123,32 @@ watch(
 )
 
 watch(
+  () => [selectedCaveId.value, batchOptions.value.length] as const,
+  () => {
+    const list = batchOptions.value
+    if (!list.some((batch) => batch.id === selectedBatchId.value)) {
+      selectedBatchId.value = list.length > 0 ? list[list.length - 1].id : ''
+    }
+  },
+  { immediate: true }
+)
+
+// 选了批次即沿用批次当时的基准与磁偏角（编辑单站时以单站为准）
+watch(currentBatch, (batch) => {
+  if (batch && editingId.value === null) {
+    form.datum = batch.datum
+    form.declination = batch.declination
+  }
+})
+
+watch(
+  () => form.datum,
+  (datum) => {
+    if (datum === 'true') form.declination = 0
+  }
+)
+
+watch(
   () => selectedSegmentId.value,
   () => {
     editingId.value = null
@@ -119,6 +160,14 @@ watch(
 async function submit(continueNext: boolean): Promise<void> {
   if (!selectedSegmentId.value) {
     ElMessage.warning('请先选择洞段')
+    return
+  }
+  if (!selectedBatchId.value) {
+    ElMessage.warning('请先选择测量批次（读数需挂当时基准）')
+    return
+  }
+  if (form.datum === 'magnetic' && !(Math.abs(form.declination) <= 90)) {
+    ElMessage.warning('磁偏角必须在 −90°～90° 之间')
     return
   }
   if (!form.code.trim()) {
@@ -141,8 +190,11 @@ async function submit(continueNext: boolean): Promise<void> {
   const station: Station = {
     id: existing?.id ?? uid('st'),
     segmentId: selectedSegmentId.value,
+    batchId: selectedBatchId.value,
     code: form.code.trim(),
     bearing: form.bearing,
+    datum: form.datum,
+    declination: form.datum === 'magnetic' ? form.declination : 0,
     dip: form.dip,
     slopeDistance: form.slopeDistance,
     horizontalDistance: previewHorizontal.value,
@@ -167,8 +219,11 @@ async function submit(continueNext: boolean): Promise<void> {
 
 function editStation(station: Station): void {
   editingId.value = station.id
+  selectedBatchId.value = station.batchId
   form.code = station.code
   form.bearing = station.bearing
+  form.datum = station.datum
+  form.declination = station.declination
   form.dip = station.dip
   form.slopeDistance = station.slopeDistance
   form.instrumentNo = station.instrumentNo
@@ -207,6 +262,14 @@ async function removeStation(station: Station): Promise<void> {
           :key="segment.id"
           :label="`${segment.code}（${segment.startStake} → ${segment.endStake}）`"
           :value="segment.id"
+        />
+      </el-select>
+      <el-select v-model="selectedBatchId" placeholder="选择测量批次" style="width: 200px">
+        <el-option
+          v-for="batch in batchOptions"
+          :key="batch.id"
+          :label="`${batch.code} · ${BEARING_DATUM_LABELS[batch.datum]}${batch.datum === 'magnetic' ? `（${batch.declination}°）` : ''}`"
+          :value="batch.id"
         />
       </el-select>
       <SegmentTag v-if="currentSegment" :type="currentSegment.type" :closed="currentSegment.closed" size="small" />
@@ -259,13 +322,40 @@ async function removeStation(station: Station): Promise<void> {
             </el-form-item>
           </el-col>
         </el-row>
+        <el-row :gutter="16">
+          <el-col :span="6">
+            <el-form-item label="方位基准">
+              <el-select v-model="form.datum" style="width: 100%">
+                <el-option label="磁北（罗盘原读数）" value="magnetic" />
+                <el-option label="真北（统一基准）" value="true" />
+              </el-select>
+            </el-form-item>
+          </el-col>
+          <el-col :span="6">
+            <el-form-item label="磁偏角(°)">
+              <el-input-number
+                v-model="form.declination"
+                :min="-90"
+                :max="90"
+                :step="0.5"
+                :precision="2"
+                :disabled="form.datum === 'true'"
+                :controls="false"
+                style="width: 100%"
+              />
+            </el-form-item>
+          </el-col>
+        </el-row>
         <el-form-item label="备注">
           <el-input v-model="form.note" type="textarea" :rows="2" placeholder="岩壁、滴水、崩塌堆积等现场情况" />
         </el-form-item>
         <div class="preview">
           <el-tag effect="plain">自动推算：水平距 {{ previewHorizontal.toFixed(3) }} m</el-tag>
           <el-tag effect="plain">垂距 {{ previewVertical.toFixed(3) }} m</el-tag>
-          <el-tag effect="plain">方位角 {{ formatDms(form.bearing) }}</el-tag>
+          <el-tag effect="plain">方位角 {{ formatDms(form.bearing) }}（{{ BEARING_DATUM_LABELS[form.datum] }}）</el-tag>
+          <el-tag v-if="form.datum === 'magnetic'" type="warning" effect="plain">
+            折真北 {{ trueBearingOf(pendingStation).toFixed(2) }}°
+          </el-tag>
           <el-tag effect="plain">倾角 {{ formatDms(form.dip) }}</el-tag>
         </div>
         <div class="actions">
@@ -296,8 +386,23 @@ async function removeStation(station: Station): Promise<void> {
     <h3 class="section-title">本洞段读数（{{ segmentStations.length }} 站）</h3>
     <el-table :data="segmentStations" border stripe :row-class-name="rowClassName">
       <el-table-column prop="code" label="桩号" width="90" />
-      <el-table-column label="方位角" width="150">
-        <template #default="{ row }: { row: Station }">{{ row.bearing }}° / {{ formatDms(row.bearing) }}</template>
+      <el-table-column label="方位角（记录基准）" width="170">
+        <template #default="{ row }: { row: Station }">
+          {{ row.bearing }}° / {{ formatDms(row.bearing) }}
+        </template>
+      </el-table-column>
+      <el-table-column label="基准 / 磁偏角" width="130">
+        <template #default="{ row }: { row: Station }">
+          <el-tag :type="row.datum === 'magnetic' ? 'warning' : 'success'" size="small" effect="plain">
+            {{ BEARING_DATUM_LABELS[row.datum] }}
+          </el-tag>
+          <div v-if="row.datum === 'magnetic'" class="sub">{{ row.declination }}°</div>
+        </template>
+      </el-table-column>
+      <el-table-column label="折真北方位角" width="130">
+        <template #default="{ row }: { row: Station }">
+          <span :class="{ 'true-shift': row.datum === 'magnetic' }">{{ trueBearingOf(row).toFixed(2) }}°</span>
+        </template>
       </el-table-column>
       <el-table-column label="倾角" width="140">
         <template #default="{ row }: { row: Station }">{{ row.dip }}°</template>
@@ -358,5 +463,13 @@ async function removeStation(station: Station): Promise<void> {
 }
 :deep(.abnormal-row td) {
   color: #b03030;
+}
+.sub {
+  font-size: 11px;
+  color: #8a6d1f;
+}
+.true-shift {
+  color: #b8842a;
+  font-weight: 600;
 }
 </style>

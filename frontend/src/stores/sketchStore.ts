@@ -9,6 +9,10 @@ export interface SketchState {
   save: (sketch: Sketch) => Promise<void>
   remove: (id: string) => Promise<void>
   reorder: (orderedIds: string[]) => Promise<void>
+  /** 制图室逐张认过：待核 → 已认过，记录认图人与时间 */
+  review: (id: string, reviewer: string) => Promise<void>
+  /** 撤回认过：已认过 → 待核（认图有误时用） */
+  unreview: (id: string) => Promise<void>
 }
 
 export const sketchStore = createStore<SketchState>((set, get) => ({
@@ -36,5 +40,24 @@ export const sketchStore = createStore<SketchState>((set, get) => ({
       })
     )
     await get().hydrate()
+  },
+  review: async (id, reviewer) => {
+    const target = get().sketches.find((item) => item.id === id)
+    if (target) {
+      await syncPut<Sketch>(db.sketches, {
+        ...target,
+        reviewStatus: 'approved',
+        reviewer: reviewer.trim() || target.author || '制图室',
+        reviewedAt: new Date().toISOString()
+      })
+      await get().hydrate()
+    }
+  },
+  unreview: async (id) => {
+    const target = get().sketches.find((item) => item.id === id)
+    if (target) {
+      await syncPut<Sketch>(db.sketches, { ...target, reviewStatus: 'pending', reviewedAt: '' })
+      await get().hydrate()
+    }
   }
 }))
