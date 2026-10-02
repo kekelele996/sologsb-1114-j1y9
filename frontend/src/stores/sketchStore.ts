@@ -1,5 +1,5 @@
 import { createStore } from 'zustand/vanilla'
-import type { Sketch } from '@/types'
+import type { ReviewStatus, Sketch } from '@/types'
 import { db, syncAll, syncDelete, syncPut } from '@/hooks/usePersistentStore'
 
 export interface SketchState {
@@ -9,6 +9,8 @@ export interface SketchState {
   save: (sketch: Sketch) => Promise<void>
   remove: (id: string) => Promise<void>
   reorder: (orderedIds: string[]) => Promise<void>
+  /** 制图室核认：待核 ↔ 认过 */
+  setReviewStatus: (id: string, status: ReviewStatus) => Promise<void>
 }
 
 export const sketchStore = createStore<SketchState>((set, get) => ({
@@ -35,6 +37,16 @@ export const sketchStore = createStore<SketchState>((set, get) => ({
         return target ? syncPut<Sketch>(db.sketches, { ...target, mergeOrder: index + 1 }) : Promise.resolve()
       })
     )
+    await get().hydrate()
+  },
+  setReviewStatus: async (id, status) => {
+    const target = get().sketches.find((item) => item.id === id)
+    if (!target) return
+    await syncPut<Sketch>(db.sketches, {
+      ...target,
+      reviewStatus: status,
+      reviewNote: status === 'confirmed' ? '' : target.reviewNote
+    })
     await get().hydrate()
   }
 }))

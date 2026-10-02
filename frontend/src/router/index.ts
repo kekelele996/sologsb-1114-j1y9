@@ -32,6 +32,12 @@ const routes: RouteRecordRaw[] = [
     component: () => import('@/pages/MergePage.vue'),
     meta: { title: '图幅拼合' }
   },
+  {
+    path: '/datum',
+    name: 'datum',
+    component: () => import('@/pages/DatumPage.vue'),
+    meta: { title: '基准对账' }
+  },
   { path: '/:pathMatch(.*)*', redirect: '/caves' }
 ]
 

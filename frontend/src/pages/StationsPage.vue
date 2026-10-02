@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import type { Station } from '@/types'
+import type { Station, SurveyBatch } from '@/types'
+import { DATUM_LABELS } from '@/types'
 import BearingInput from '@/components/common/BearingInput.vue'
 import ClosureBadge from '@/components/common/ClosureBadge.vue'
 import SegmentTag from '@/components/common/SegmentTag.vue'
@@ -10,12 +11,22 @@ import { useClosureCheck } from '@/hooks/useClosureCheck'
 import { segmentStore } from '@/stores/segmentStore'
 import { stationStore } from '@/stores/stationStore'
 import { caveStore } from '@/stores/caveStore'
-import { computeHorizontal, computeVertical, formatDms, isValidBearing, isValidDip } from '@/utils/survey'
+import { batchStore } from '@/stores/batchStore'
+import {
+  computeHorizontal,
+  computeVertical,
+  formatDms,
+  isValidBearing,
+  isValidDip,
+  normalizeBearing,
+  trueBearing
+} from '@/utils/survey'
 import { nextCode, uid } from '@/utils/id'
 
 const caveState = useStore(caveStore)
 const segmentState = useStore(segmentStore)
 const stationState = useStore(stationStore)
+const batchState = useStore(batchStore)
 
 const selectedCaveId = ref<string>(caveState.caves[0]?.id ?? '')
 const selectedSegmentId = ref<string>('')
@@ -27,6 +38,7 @@ const form = reactive({
   bearing: 90,
   dip: 0,
   slopeDistance: 10,
+  batchId: '',
   instrumentNo: 'SOKKIA-2',
   surveyor: '',
   date: new Date().toISOString().slice(0, 10),
@@ -40,6 +52,27 @@ const segmentOptions = computed(() =>
 )
 const currentSegment = computed(() => segmentState.segments.find((segment) => segment.id === selectedSegmentId.value))
 
+const caveBatches = computed(() => batchState.batches.filter((batch) => batch.caveId === selectedCaveId.value))
+const batchMap = computed(() => new Map<string, SurveyBatch>(batchState.batches.map((batch) => [batch.id, batch])))
+
+function batchOf(station: Station): SurveyBatch | undefined {
+  return batchMap.value.get(station.batchId)
+}
+
+function batchOptionLabel(batch: SurveyBatch): string {
+  const pending = batch.datum === 'magnetic' && batch.declination === null ? ' · 待补磁偏角' : ''
+  return `${batch.code}（${DATUM_LABELS[batch.datum]}${pending}）`
+}
+
+/** 归算到真北后的方位角；与原始读数不同时表格中并列展示 */
+function trueBearingOf(station: Station): number {
+  return trueBearing(station, batchOf(station))
+}
+
+function showTrueBearing(station: Station): boolean {
+  return Math.abs(trueBearingOf(station) - normalizeBearing(station.bearing)) > 1e-9
+}
+
 const segmentStations = computed(() =>
   stationState.stations
     .filter((station) => station.segmentId === selectedSegmentId.value)
@@ -50,6 +83,7 @@ const segmentStations = computed(() =>
 const pendingStation = computed<Station>(() => ({
   id: 'pending',
   segmentId: selectedSegmentId.value,
+  batchId: form.batchId,
   code: form.code,
   bearing: form.bearing,
   dip: form.dip,
@@ -64,7 +98,7 @@ const pendingStation = computed<Station>(() => ({
 }))
 
 const closureInput = computed<Station[]>(() => [...segmentStations.value, pendingStation.value])
-const { result: closureResult, over: closureOver } = useClosureCheck(closureInput)
+const { result: closureResult, over: closureOver } = useClosureCheck(closureInput, 0.25, batchMap)
 
 const previewHorizontal = computed(() => computeHorizontal(form.dip, form.slopeDistance))
 const previewVertical = computed(() => computeVertical(form.dip, form.slopeDistance))
@@ -116,6 +150,18 @@ watch(
   { immediate: true }
 )
 
+// 批次默认取本洞穴最新一批；洞穴还没有批次时留空，保存测点时自动建立真北批次
+watch(
+  () => [selectedCaveId.value, caveBatches.value.length] as const,
+  () => {
+    if (!caveBatches.value.some((batch) => batch.id === form.batchId)) {
+      const latest = [...caveBatches.value].sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0]
+      form.batchId = latest?.id ?? ''
+    }
+  },
+  { immediate: true }
+)
+
 async function submit(continueNext: boolean): Promise<void> {
   if (!selectedSegmentId.value) {
     ElMessage.warning('请先选择洞段')
@@ -138,9 +184,16 @@ async function submit(continueNext: boolean): Promise<void> {
     return
   }
   const existing = stationState.stations.find((station) => station.id === editingId.value)
+  let batchId = form.batchId
+  if (!batchId) {
+    const batch = await batchStore.getState().ensureDefault(selectedCaveId.value)
+    batchId = batch.id
+    form.batchId = batchId
+  }
   const station: Station = {
     id: existing?.id ?? uid('st'),
     segmentId: selectedSegmentId.value,
+    batchId,
     code: form.code.trim(),
     bearing: form.bearing,
     dip: form.dip,
@@ -171,6 +224,7 @@ function editStation(station: Station): void {
   form.bearing = station.bearing
   form.dip = station.dip
   form.slopeDistance = station.slopeDistance
+  form.batchId = station.batchId
   form.instrumentNo = station.instrumentNo
   form.surveyor = station.surveyor
   form.date = station.date
@@ -238,22 +292,34 @@ async function removeStation(station: Station): Promise<void> {
           </el-col>
         </el-row>
         <el-row :gutter="16">
-          <el-col :span="6">
+          <el-col :span="5">
             <el-form-item label="仪器号">
               <el-input v-model="form.instrumentNo" />
             </el-form-item>
           </el-col>
-          <el-col :span="6">
+          <el-col :span="5">
             <el-form-item label="测量人">
               <el-input v-model="form.surveyor" />
             </el-form-item>
           </el-col>
-          <el-col :span="6">
+          <el-col :span="5">
             <el-form-item label="测量日期">
               <el-date-picker v-model="form.date" type="date" value-format="YYYY-MM-DD" style="width: 100%" />
             </el-form-item>
           </el-col>
           <el-col :span="6">
+            <el-form-item label="测量批次">
+              <el-select v-model="form.batchId" placeholder="保存时自动建真北批次" style="width: 100%">
+                <el-option
+                  v-for="batch in caveBatches"
+                  :key="batch.id"
+                  :label="batchOptionLabel(batch)"
+                  :value="batch.id"
+                />
+              </el-select>
+            </el-form-item>
+          </el-col>
+          <el-col :span="3">
             <el-form-item label="闭合点">
               <el-switch v-model="form.isClosurePoint" />
             </el-form-item>
@@ -296,8 +362,27 @@ async function removeStation(station: Station): Promise<void> {
     <h3 class="section-title">本洞段读数（{{ segmentStations.length }} 站）</h3>
     <el-table :data="segmentStations" border stripe :row-class-name="rowClassName">
       <el-table-column prop="code" label="桩号" width="90" />
-      <el-table-column label="方位角" width="150">
-        <template #default="{ row }: { row: Station }">{{ row.bearing }}° / {{ formatDms(row.bearing) }}</template>
+      <el-table-column label="批次·基准" width="130">
+        <template #default="{ row }: { row: Station }">
+          <template v-if="batchOf(row)">
+            <span class="mono">{{ batchOf(row)!.code }}</span>
+            <el-tag
+              :type="batchOf(row)!.datum === 'magnetic' ? 'warning' : 'success'"
+              size="small"
+              effect="plain"
+              class="datum-tag"
+            >
+              {{ DATUM_LABELS[batchOf(row)!.datum] }}
+            </el-tag>
+          </template>
+          <span v-else class="muted">—</span>
+        </template>
+      </el-table-column>
+      <el-table-column label="方位角" width="170">
+        <template #default="{ row }: { row: Station }">
+          {{ row.bearing }}° / {{ formatDms(row.bearing) }}
+          <div v-if="showTrueBearing(row)" class="muted">→ 真北 {{ trueBearingOf(row) }}°</div>
+        </template>
       </el-table-column>
       <el-table-column label="倾角" width="140">
         <template #default="{ row }: { row: Station }">{{ row.dip }}°</template>
@@ -358,5 +443,8 @@ async function removeStation(station: Station): Promise<void> {
 }
 :deep(.abnormal-row td) {
   color: #b03030;
+}
+.datum-tag {
+  margin-left: 6px;
 }
 </style>

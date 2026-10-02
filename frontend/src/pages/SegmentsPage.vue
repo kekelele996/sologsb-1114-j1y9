@@ -1,19 +1,21 @@
 <script setup lang="ts">
 import { computed, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import type { Segment, SegmentType } from '@/types'
+import type { Segment, SegmentType, SurveyBatch } from '@/types'
 import { SEGMENT_TYPES, segmentLength } from '@/types'
 import SegmentTag from '@/components/common/SegmentTag.vue'
 import { useStore } from '@/hooks/usePersistentStore'
 import { caveStore } from '@/stores/caveStore'
 import { segmentStore } from '@/stores/segmentStore'
 import { stationStore } from '@/stores/stationStore'
-import { stakeRangeOverlap, stakeToNumber } from '@/utils/survey'
+import { batchStore } from '@/stores/batchStore'
+import { computeClosure, stakeRangeOverlap, stakeToNumber } from '@/utils/survey'
 import { uid } from '@/utils/id'
 
 const caveState = useStore(caveStore)
 const segmentState = useStore(segmentStore)
 const stationState = useStore(stationStore)
+const batchState = useStore(batchStore)
 
 const filterCaveId = ref<string>('')
 const filterType = ref<SegmentType | ''>('')
@@ -61,6 +63,15 @@ function caveName(caveId: string): string {
 
 function stationCount(segmentId: string): number {
   return stationState.stations.filter((station) => station.segmentId === segmentId).length
+}
+
+/** 洞段闭合差：磁北批次的读数按磁偏角归算真北后参与累计，基准更正后自动重算 */
+const batchMap = computed(() => new Map<string, SurveyBatch>(batchState.batches.map((batch) => [batch.id, batch])))
+
+function closureOf(segmentId: string) {
+  const list = stationState.stations.filter((station) => station.segmentId === segmentId)
+  if (list.length === 0) return null
+  return computeClosure(list, 0.25, batchMap.value)
 }
 
 function resetForm(): void {
@@ -165,7 +176,7 @@ async function removeSegment(segment: Segment): Promise<void> {
       <div>
         <h2 class="page-title">洞段编目表</h2>
         <p class="page-sub">
-          按桩号区间筛选洞段、批量调整洞段类型；洞段长度由起止桩号自动计算，并累计为洞穴实测总长。
+          按桩号区间筛选洞段、批量调整洞段类型；洞段长度由起止桩号自动计算，闭合差按批次基准（磁偏角归算真北）实时重算。
         </p>
       </div>
       <el-button type="primary" @click="openCreate">
@@ -228,6 +239,19 @@ async function removeSegment(segment: Segment): Promise<void> {
       <el-table-column prop="slopeTrend" label="坡度趋势" width="120" />
       <el-table-column label="测点数" width="90">
         <template #default="{ row }: { row: Segment }">{{ stationCount(row.id) }}</template>
+      </el-table-column>
+      <el-table-column label="闭合差" width="110">
+        <template #default="{ row }: { row: Segment }">
+          <el-tag
+            v-if="closureOf(row.id)"
+            :type="closureOf(row.id)!.over ? 'danger' : 'success'"
+            size="small"
+            effect="plain"
+          >
+            {{ closureOf(row.id)!.closure.toFixed(3) }} m
+          </el-tag>
+          <span v-else class="muted">—</span>
+        </template>
       </el-table-column>
       <el-table-column prop="sketchNo" label="草图序号" width="100" />
       <el-table-column label="操作" width="140" fixed="right">

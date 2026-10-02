@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import type { Sketch, Station } from '@/types'
+import type { DatumKind, Sketch, Station, SurveyBatch } from '@/types'
 import BearingInput from '@/components/common/BearingInput.vue'
 import GridCanvas from '@/components/common/GridCanvas.vue'
 import { useStore } from '@/hooks/usePersistentStore'
@@ -9,13 +9,15 @@ import { caveStore } from '@/stores/caveStore'
 import { segmentStore } from '@/stores/segmentStore'
 import { stationStore } from '@/stores/stationStore'
 import { sketchStore } from '@/stores/sketchStore'
-import { toRadians } from '@/utils/survey'
+import { batchStore } from '@/stores/batchStore'
+import { toRadians, trueBearing } from '@/utils/survey'
 import { uid } from '@/utils/id'
 
 const caveState = useStore(caveStore)
 const segmentState = useStore(segmentStore)
 const stationState = useStore(stationStore)
 const sketchState = useStore(sketchStore)
+const batchState = useStore(batchStore)
 
 const CANVAS_W = 760
 const CANVAS_H = 440
@@ -70,19 +72,29 @@ const segmentStations = computed<Station[]>(() =>
     .sort((a, b) => Number((a.code.match(/\d+/) ?? ['0'])[0]) - Number((b.code.match(/\d+/) ?? ['0'])[0]))
 )
 
-/** 测点折线：以起点为原点，按方位角/水平距投影到平面坐标 */
+/** 测点折线：以起点为原点，按方位角/水平距投影到平面坐标；
+ *  磁北批次的读数先按磁偏角归算到真北，两批结果画到一张图上不再差着磁偏角 */
 interface PlotPoint {
   station: Station
   x: number
   y: number
 }
 
+const batchMap = computed(() => new Map<string, SurveyBatch>(batchState.batches.map((batch) => [batch.id, batch])))
+
+function datumOf(station: Station): DatumKind {
+  return batchMap.value.get(station.batchId)?.datum ?? 'true'
+}
+
+/** 本洞段读数是否横跨两种基准（磁北/真北） */
+const mixedDatum = computed(() => new Set(segmentStations.value.map((station) => datumOf(station))).size > 1)
+
 const rawPoints = computed<{ x: number; y: number; station: Station }[]>(() => {
   const points: { x: number; y: number; station: Station }[] = []
   let east = 0
   let north = 0
   for (const station of segmentStations.value) {
-    const bearing = toRadians(station.bearing - baseBearing.value)
+    const bearing = toRadians(trueBearing(station, batchMap.value.get(station.batchId)) - baseBearing.value)
     east += station.horizontalDistance * Math.sin(bearing)
     north += station.horizontalDistance * Math.cos(bearing)
     points.push({ x: east, y: north, station })
@@ -155,7 +167,9 @@ async function submit(): Promise<void> {
     author: form.author.trim(),
     mergeOrder: Number(form.mergeOrder) || 1,
     anchorStake: form.anchorStake.trim(),
-    imageNote: form.imageNote.trim()
+    imageNote: form.imageNote.trim(),
+    reviewStatus: existing?.reviewStatus ?? 'confirmed',
+    reviewNote: existing?.reviewNote ?? ''
   }
   await sketchStore.getState().save(sketch)
   ElMessage.success(existing ? '草图记录已更新' : '草图记录已建立')
@@ -201,6 +215,7 @@ async function removeSketch(sketch: Sketch): Promise<void> {
       </el-select>
       <el-tag effect="plain">测点 {{ segmentStations.length }} 个</el-tag>
       <el-tag effect="plain">草图 {{ segmentSketches.length }} 张</el-tag>
+      <el-tag v-if="mixedDatum" type="warning" effect="plain">基准混用：折线已按真北统一归算</el-tag>
       <div class="base-bearing">
         <BearingInput v-model="baseBearing" kind="bearing" label="草图基准方位" @invalid="(msg: string) => ElMessage.warning(msg)" />
       </div>
@@ -218,7 +233,12 @@ async function removeSketch(sketch: Sketch): Promise<void> {
           <polyline :points="polyline" fill="none" stroke="#2f6f8f" stroke-width="2.5" stroke-linejoin="round" />
         </g>
         <g v-for="(point, index) in plotPoints" :key="point.station.id">
-          <circle :cx="point.x" :cy="point.y" r="4.5" fill="#1f3a4d" />
+          <circle
+            :cx="point.x"
+            :cy="point.y"
+            r="4.5"
+            :fill="datumOf(point.station) === 'magnetic' ? '#c98a1b' : '#1f3a4d'"
+          />
           <line
             :x1="point.x"
             :y1="point.y"
@@ -244,7 +264,7 @@ async function removeSketch(sketch: Sketch): Promise<void> {
           </marker>
         </defs>
         <template #legend>
-          <span>● 测点</span>
+          <span>● 测点（橙 = 磁北批次）</span>
           <span>▸ 倾角方向</span>
           <span>深色线 = 5 格</span>
           <span>1 格 = 1 m</span>

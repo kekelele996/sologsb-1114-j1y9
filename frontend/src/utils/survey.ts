@@ -1,4 +1,26 @@
-import type { ClosureResult, Station } from '@/types'
+import type { ClosureResult, Station, SurveyBatch } from '@/types'
+
+/** 磁偏角合理范围（度），超出视为读数或转录错误 */
+export const DECLINATION_LIMIT = 30
+
+/** 校验磁偏角：必须有限且不超过 ±30° */
+export function isValidDeclination(deg: number | null | undefined): deg is number {
+  return typeof deg === 'number' && Number.isFinite(deg) && Math.abs(deg) <= DECLINATION_LIMIT
+}
+
+/**
+ * 归算到真北的方位角：磁北批次补录磁偏角后，读数 + 磁偏角 → 真北方位；
+ * 真北批次或磁偏角未补录时返回原始读数。
+ */
+export function trueBearing(
+  station: Pick<Station, 'bearing'>,
+  batch?: Pick<SurveyBatch, 'datum' | 'declination'> | null
+): number {
+  if (batch && batch.datum === 'magnetic' && isValidDeclination(batch.declination)) {
+    return normalizeBearing(station.bearing + batch.declination)
+  }
+  return normalizeBearing(station.bearing)
+}
 
 /** 角度转弧度 */
 export function toRadians(deg: number): number {
@@ -112,18 +134,24 @@ export function stakeRangeOverlap(a1: number, a2: number, b1: number, b2: number
 /**
  * 闭合差：把每站的方位角与水平距分解为东向/北向增量，
  * 导线闭合差即累计位移向量的模。
+ * 传入批次表时，磁北读数先按磁偏角归算到真北再参与累计，
+ * 保证不同基准的两批读数画到一张图上不再差着磁偏角。
  */
-export function computeClosure(stations: Station[], threshold = 0.25): ClosureResult {
+export function computeClosure(stations: Station[], threshold = 0.25, batches?: Map<string, SurveyBatch>): ClosureResult {
   let east = 0
   let north = 0
+  let corrected = 0
   for (const station of stations) {
-    const bearing = toRadians(normalizeBearing(station.bearing))
+    const batch = batches?.get(station.batchId)
+    const bearing = toRadians(trueBearing(station, batch))
+    if (batch && batch.datum === 'magnetic' && isValidDeclination(batch.declination)) corrected += 1
     const horizontal = station.horizontalDistance || computeHorizontal(station.dip, station.slopeDistance)
     east += horizontal * Math.sin(bearing)
     north += horizontal * Math.cos(bearing)
   }
   const closure = round(Math.hypot(east, north), 3)
   const level: ClosureResult['level'] = closure < threshold * 0.4 ? '优' : closure < threshold ? '良' : '超限'
+  const datumNote = corrected > 0 ? `，其中 ${corrected} 站磁北读数已按磁偏角归算至真北` : ''
   return {
     closure,
     threshold,
@@ -132,6 +160,6 @@ export function computeClosure(stations: Station[], threshold = 0.25): ClosureRe
     count: stations.length,
     east: round(east, 3),
     north: round(north, 3),
-    detail: `东向累计 ΣΔE = ${round(east, 3)} m，北向累计 ΣΔN = ${round(north, 3)} m，闭合差 f = √(ΣΔE² + ΣΔN²) = ${closure} m，阈值 ${threshold} m`
+    detail: `东向累计 ΣΔE = ${round(east, 3)} m，北向累计 ΣΔN = ${round(north, 3)} m，闭合差 f = √(ΣΔE² + ΣΔN²) = ${closure} m，阈值 ${threshold} m${datumNote}`
   }
 }

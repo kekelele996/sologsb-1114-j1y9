@@ -1,23 +1,26 @@
 import { onUnmounted, reactive } from 'vue'
 import type { StoreApi } from 'zustand/vanilla'
 import Dexie, { type Table } from 'dexie'
-import type { Cave, Segment, Sketch, Station } from '@/types'
+import type { Cave, CorrectionLog, Segment, Sketch, Station, SurveyBatch } from '@/types'
 import { computeHorizontal, computeVertical } from '@/utils/survey'
+import { uid } from '@/utils/id'
 
 /** IndexedDB 数据结构版本号（升级迁移时使用） */
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
 
 export interface MetaRow {
   key: string
   value: number
 }
 
-/** Dexie 封装：洞穴 / 洞段 / 测点 / 草图 四张表 + 元数据表 */
+/** Dexie 封装：洞穴 / 洞段 / 测点 / 草图 / 批次 / 更正记录 六张表 + 元数据表 */
 class CaveSurveyDb extends Dexie {
   caves!: Table<Cave, string>
   segments!: Table<Segment, string>
   stations!: Table<Station, string>
   sketches!: Table<Sketch, string>
+  batches!: Table<SurveyBatch, string>
+  corrections!: Table<CorrectionLog, string>
   meta!: Table<MetaRow, string>
 
   constructor() {
@@ -30,7 +33,7 @@ class CaveSurveyDb extends Dexie {
       meta: 'key'
     })
     // v2：旧版测点记录缺少水平距/垂距，迁移时由斜距 + 倾角补齐
-    this.version(SCHEMA_VERSION)
+    this.version(2)
       .stores({
         caves: 'id, name, region, archived',
         segments: 'id, caveId, code, type',
@@ -49,6 +52,73 @@ class CaveSurveyDb extends Dexie {
             if (!Number.isFinite(station.verticalDistance)) {
               station.verticalDistance = computeVertical(station.dip, station.slopeDistance)
             }
+          })
+      })
+    // v3：引入测量批次（磁北/真北基准 + 磁偏角）与更正记录；
+    // 旧测点无基准记载，升级时归到最早一批（磁北·历史遗留）；旧图幅视为已认过
+    this.version(SCHEMA_VERSION)
+      .stores({
+        caves: 'id, name, region, archived',
+        segments: 'id, caveId, code, type',
+        stations: 'id, segmentId, code, date, batchId',
+        sketches: 'id, segmentId, code, mergeOrder, reviewStatus',
+        batches: 'id, caveId, code, datum',
+        corrections: 'id, batchId, caveId, createdAt',
+        meta: 'key'
+      })
+      .upgrade(async (tx) => {
+        const segments = await tx.table<Segment, string>('segments').toArray()
+        const caveOfSegment = new Map(segments.map((segment) => [segment.id, segment.caveId]))
+        const stations = await tx.table<Station, string>('stations').toArray()
+        const batchesTable = tx.table<SurveyBatch, string>('batches')
+
+        // 每个洞穴的最早一批（按建立时间、批次号排序）
+        const earliestByCave = new Map<string, string>()
+        const existing = await batchesTable.toArray()
+        existing
+          .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.code.localeCompare(b.code, 'zh-Hans-CN'))
+          .forEach((batch) => {
+            if (!earliestByCave.has(batch.caveId)) earliestByCave.set(batch.caveId, batch.id)
+          })
+
+        // 旧数据无基准记载：为缺批次的洞穴补建「磁北·历史遗留」批次并归入
+        const now = new Date().toISOString()
+        const legacyBatches: SurveyBatch[] = []
+        for (const station of stations) {
+          if (station.batchId) continue
+          const caveId = caveOfSegment.get(station.segmentId) ?? ''
+          if (earliestByCave.has(caveId)) continue
+          const batch: SurveyBatch = {
+            id: uid('batch'),
+            caveId,
+            code: 'B-01',
+            datum: 'magnetic',
+            declination: null,
+            status: 'pending',
+            keeper: '',
+            spanNote: '历史遗留批次：旧数据无基准记载，升级归入最早一批',
+            createdAt: now
+          }
+          legacyBatches.push(batch)
+          earliestByCave.set(caveId, batch.id)
+        }
+        if (legacyBatches.length > 0) await batchesTable.bulkPut(legacyBatches)
+
+        await tx
+          .table<Station, string>('stations')
+          .toCollection()
+          .modify((station) => {
+            if (!station.batchId) {
+              const caveId = caveOfSegment.get(station.segmentId) ?? ''
+              station.batchId = earliestByCave.get(caveId) ?? ''
+            }
+          })
+        await tx
+          .table<Sketch, string>('sketches')
+          .toCollection()
+          .modify((sketch) => {
+            if (!sketch.reviewStatus) sketch.reviewStatus = 'confirmed'
+            if (typeof sketch.reviewNote !== 'string') sketch.reviewNote = ''
           })
       })
   }
@@ -106,6 +176,8 @@ export async function seedDemoData(): Promise<void> {
   const caveId = 'cave_demo_001'
   const segmentA = 'seg_demo_001'
   const segmentB = 'seg_demo_002'
+  const batchLegacy = 'batch_demo_001'
+  const batchCurrent = 'batch_demo_002'
 
   const today = new Date().toISOString().slice(0, 10)
 
@@ -154,10 +226,36 @@ export async function seedDemoData(): Promise<void> {
     }
   ])
 
+  await db.batches.bulkPut([
+    {
+      id: batchLegacy,
+      caveId,
+      code: 'B-01',
+      datum: 'magnetic',
+      declination: null,
+      status: 'pending',
+      keeper: '陆昀',
+      spanNote: '早年磁北测回，磁偏角未记载，待外业班补录',
+      createdAt: new Date().toISOString()
+    },
+    {
+      id: batchCurrent,
+      caveId,
+      code: 'B-02',
+      datum: 'true',
+      declination: null,
+      status: 'ready',
+      keeper: '陆昀',
+      spanNote: '现行真北基准测回',
+      createdAt: new Date().toISOString()
+    }
+  ])
+
   await db.stations.bulkPut([
     {
       id: 'st_demo_001',
       segmentId: segmentA,
+      batchId: batchLegacy,
       code: 'P1',
       bearing: 118.5,
       dip: -2.5,
@@ -173,6 +271,7 @@ export async function seedDemoData(): Promise<void> {
     {
       id: 'st_demo_002',
       segmentId: segmentA,
+      batchId: batchCurrent,
       code: 'P2',
       bearing: 121.2,
       dip: -1.8,
@@ -197,7 +296,9 @@ export async function seedDemoData(): Promise<void> {
       author: '陆昀',
       mergeOrder: 1,
       anchorStake: 'K0+000',
-      imageNote: '平面展开草图，坐标纸 48 格，含左壁支护标注'
+      imageNote: '平面展开草图，坐标纸 48 格，含左壁支护标注',
+      reviewStatus: 'confirmed',
+      reviewNote: ''
     },
     {
       id: 'sk_demo_002',
@@ -208,7 +309,9 @@ export async function seedDemoData(): Promise<void> {
       author: '覃羽',
       mergeOrder: 2,
       anchorStake: 'K0+120',
-      imageNote: '竖井剖面草图，标注三处锚点'
+      imageNote: '竖井剖面草图，标注三处锚点',
+      reviewStatus: 'confirmed',
+      reviewNote: ''
     }
   ])
 }

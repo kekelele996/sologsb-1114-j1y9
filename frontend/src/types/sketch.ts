@@ -1,3 +1,11 @@
+/** 图幅核认状态：待核 / 认过 */
+export type ReviewStatus = 'pending' | 'confirmed'
+
+export const REVIEW_STATUS_LABELS: Record<ReviewStatus, string> = {
+  pending: '待核',
+  confirmed: '认过'
+}
+
 /** Sketch 草图 */
 export interface Sketch {
   id: string
@@ -16,6 +24,10 @@ export interface Sketch {
   anchorStake: string
   /** 图片数据说明 */
   imageNote: string
+  /** 核认状态：基准更正后转待核，由制图室逐张认过 */
+  reviewStatus: ReviewStatus
+  /** 最近一次转待核的原因 */
+  reviewNote: string
 }
 
 /** 图幅拼合对齐结果 */

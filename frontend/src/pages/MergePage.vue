@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import type { Sketch } from '@/types'
+import type { ReviewStatus, Sketch, SurveyBatch } from '@/types'
 import ClosureBadge from '@/components/common/ClosureBadge.vue'
 import GridCanvas from '@/components/common/GridCanvas.vue'
 import SegmentTag from '@/components/common/SegmentTag.vue'
@@ -11,6 +11,7 @@ import { caveStore } from '@/stores/caveStore'
 import { segmentStore } from '@/stores/segmentStore'
 import { stationStore } from '@/stores/stationStore'
 import { sketchStore } from '@/stores/sketchStore'
+import { batchStore } from '@/stores/batchStore'
 import { downloadCsv } from '@/utils/export'
 import { stakeToNumber } from '@/utils/survey'
 
@@ -23,6 +24,7 @@ const caveState = useStore(caveStore)
 const segmentState = useStore(segmentStore)
 const stationState = useStore(stationStore)
 const sketchState = useStore(sketchStore)
+const batchState = useStore(batchStore)
 
 const selectedCaveId = ref<string>(caveState.caves[0]?.id ?? '')
 const draggingId = ref<string | null>(null)
@@ -78,13 +80,24 @@ watch(
   { immediate: true }
 )
 
-/** 洞段测点闭合差（拼合视图复用闭合差徽标） */
+/** 洞段测点闭合差（拼合视图复用闭合差徽标；磁北批次按磁偏角归算真北） */
 const caveStations = computed(() =>
   stationState.stations.filter((station) =>
     caveSegments.value.some((segment) => segment.id === station.segmentId)
   )
 )
-const { result: closureResult } = useClosureCheck(caveStations)
+const batchMap = computed(() => new Map<string, SurveyBatch>(batchState.batches.map((batch) => [batch.id, batch])))
+const { result: closureResult } = useClosureCheck(caveStations, 0.25, batchMap)
+
+const pendingSheetCount = computed(
+  () => mergeSketches.value.filter((sketch) => sketch.reviewStatus === 'pending').length
+)
+
+/** 制图室逐张认过：认过后的图幅在后续更正重试中保留 */
+async function confirmSheet(sketch: Sketch): Promise<void> {
+  await sketchStore.getState().setReviewStatus(sketch.id, 'confirmed')
+  ElMessage.success(`图幅 ${sketch.code} 已认过`)
+}
 
 /** 按桩号锚点自动吸附：以最小锚点桩号为原点，按桩号差换算横向偏移 */
 function autoAlign(): void {
@@ -149,6 +162,7 @@ interface MergeRow {
   anchorStake: string
   offset: number
   snapped: boolean
+  reviewStatus: ReviewStatus
 }
 
 const mergeRows = computed<MergeRow[]>(() =>
@@ -158,7 +172,8 @@ const mergeRows = computed<MergeRow[]>(() =>
     segment: segmentOf(sketch),
     anchorStake: sketch.anchorStake,
     offset: offsets[sketch.id] ?? 0,
-    snapped: snapped[sketch.id] ?? false
+    snapped: snapped[sketch.id] ?? false,
+    reviewStatus: sketch.reviewStatus
   }))
 )
 
@@ -175,14 +190,15 @@ async function move(index: number, direction: -1 | 1): Promise<void> {
 function exportMergeTable(): void {
   downloadCsv(
     '图幅拼合顺序表.csv',
-    mergeRows.value as unknown as Record<string, unknown>[],
+    mergeRows.value.map((row) => ({ ...row, review: row.reviewStatus === 'confirmed' ? '认过' : '待核' })),
     [
       { key: 'order', label: '拼合顺序' },
       { key: 'code', label: '草图编号' },
       { key: 'segment', label: '洞段' },
       { key: 'anchorStake', label: '锚点桩号' },
       { key: 'offset', label: '对齐偏移(px)' },
-      { key: 'snapped', label: '是否吸附' }
+      { key: 'snapped', label: '是否吸附' },
+      { key: 'review', label: '核认状态' }
     ]
   )
   ElMessage.success('拼合顺序表已导出')
@@ -209,6 +225,7 @@ function exportMergeTable(): void {
         <el-option v-for="cave in caveState.caves" :key="cave.id" :label="cave.name" :value="cave.id" />
       </el-select>
       <el-tag effect="plain">图幅 {{ mergeSketches.length }} 张</el-tag>
+      <el-tag v-if="pendingSheetCount > 0" type="warning" effect="plain">待核 {{ pendingSheetCount }} 张</el-tag>
       <el-tag effect="plain">总宽 {{ totalWidth }} px</el-tag>
       <div class="seg-tags">
         <SegmentTag
@@ -244,11 +261,13 @@ function exportMergeTable(): void {
             height="96"
             rx="6"
             :fill="snapped[sketch.id] ? 'rgba(47,111,143,0.22)' : 'rgba(143,211,199,0.28)'"
-            :stroke="snapped[sketch.id] ? '#2f6f8f' : '#1f8a70'"
+            :stroke="sketch.reviewStatus === 'pending' ? '#c98a1b' : snapped[sketch.id] ? '#2f6f8f' : '#1f8a70'"
+            :stroke-dasharray="sketch.reviewStatus === 'pending' ? '6 4' : undefined"
             stroke-width="1.6"
           />
           <text :x="(offsets[sketch.id] ?? 0) + 8" :y="62 + (index % 2) * 10" font-size="12" fill="#1f3a4d">
             {{ sketch.code }}
+            <tspan v-if="sketch.reviewStatus === 'pending'" fill="#b8860b">（待核）</tspan>
           </text>
           <text :x="(offsets[sketch.id] ?? 0) + 8" :y="80 + (index % 2) * 10" font-size="11" fill="#4a5b6b">
             锚点 {{ sketch.anchorStake }}
@@ -278,6 +297,7 @@ function exportMergeTable(): void {
           <span>拖动图幅可移动</span>
           <span>绿框 = 未吸附</span>
           <span>蓝框 = 已吸附对齐</span>
+          <span>橙色虚线框 = 待核图幅</span>
           <span>橙色短划 = 锚点桩号位置</span>
         </template>
       </GridCanvas>
@@ -315,6 +335,14 @@ function exportMergeTable(): void {
           <el-tag :type="row.snapped ? 'success' : 'info'" size="small" effect="plain">
             {{ row.snapped ? '已吸附' : '未吸附' }}
           </el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column label="核认" width="120">
+        <template #default="{ row, $index }: { row: MergeRow; $index: number }">
+          <el-tag v-if="row.reviewStatus === 'confirmed'" type="success" size="small" effect="plain">认过</el-tag>
+          <el-button v-else link type="warning" size="small" @click="confirmSheet(mergeSketches[$index])">
+            待核 · 认过
+          </el-button>
         </template>
       </el-table-column>
       <el-table-column label="调整顺序" width="180">
